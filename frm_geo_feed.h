@@ -14,6 +14,7 @@
 ///
 /// MODIFICATION HISTORY :
 ///     1.0     02-Mar-2020     First Version
+///     1.1     31-Jul-2020     change output delimiter from # to | and move description field to last
 ///
 ///
 #ifndef __GEO_FEED_H__
@@ -23,8 +24,8 @@
     extern "C" {
 #endif
 
-#define _APP_NAME_          "geo_feed"
-#define _APP_VERS_          "1.0"
+#define _APP_NAME_          "frm_geo_feed"
+#define _APP_VERS_          "1.1"
 
 
 // ----- INI Parameters -----

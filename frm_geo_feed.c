@@ -14,6 +14,7 @@
 ///
 /// MODIFICATION HISTORY :
 ///     1.0     02-Mar-2020     First Version
+///     1.1     31-Jul-2020     change output delimiter from # to | and move description field to last
 ///
 ///
 

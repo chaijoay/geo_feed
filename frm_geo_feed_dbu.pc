@@ -14,6 +14,7 @@
 ///
 /// MODIFICATION HISTORY :
 ///     1.0     02-Mar-2020     First Version
+///     1.1     31-Jul-2020     change output delimiter from # to | and move description field to last
 ///
 ///
 #include <math.h>
@@ -892,7 +893,8 @@ void wrtCellArea(char out_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
                 trimStr(szLong);
                 trimStr(szRowId);
                 updateProcRecord(tabname, szRowId, FLG_CMPL_FED);
-                fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%d\n", FLG_EFIT_SID, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szDesc, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad);
+                //fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%d\n", FLG_EFIT_SID, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szDesc, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad);
+                fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%d%c%s\n", FLG_EFIT_SID, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad, EFIT_DELIM, szDesc);
                 fprintf(mfile, "%s|%s\n", szDesc, szSid);
                 if ( ++rdRec % gnCommitRec == 0 ) {
                     writeLog(LOG_INF, "%d %s records written/committed", rdRec, tabname);
@@ -994,7 +996,8 @@ void wrtCellSet(char out_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
                 trimStr(szLong);
                 trimStr(szRowId);
                 updateProcRecord(tabname, szRowId, FLG_CMPL_FED);
-                fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%s%c%d\n", FLG_EFIT_SWID, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szSwid, EFIT_DELIM, szDesc, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad);
+                //fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%s%c%d\n", FLG_EFIT_SWID, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szSwid, EFIT_DELIM, szDesc, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad);
+                fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%d%c%s\n", FLG_EFIT_SWID, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szSwid, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad, EFIT_DELIM, szDesc);
                 if ( rdRec % gnCommitRec == 0 ) {
                     writeLog(LOG_INF, "%d %s records written/committed", rdRec, tabname);
                     fflush(ofile);
@@ -1108,7 +1111,8 @@ void wrtCell(char out_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
                 if ( *szFlag == FLG_FOR_LOAD ) {
                     oRec++;
                     updateProcRecord(tabname, szRowId, FLG_CMPL_FED);
-                    fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%s%c%s%c%d\n", FLG_EFIT_CELL, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szSwid, EFIT_DELIM, szId, EFIT_DELIM, szDesc, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad);
+                    //fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%s%c%s%c%d\n", FLG_EFIT_CELL, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szSwid, EFIT_DELIM, szId, EFIT_DELIM, szDesc, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad);
+                    fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%s%c%d%c%s\n", FLG_EFIT_CELL, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szSwid, EFIT_DELIM, szId, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad, EFIT_DELIM, szDesc);
                     if ( oRec >= MAX_REC_PER_FILE ) {
                         writeLog(LOG_INF, "max record per file reached %d, start next new file", oRec);
                         fflush(ofile);

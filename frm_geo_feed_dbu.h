@@ -14,6 +14,7 @@
 ///
 /// MODIFICATION HISTORY :
 ///     1.0     02-Mar-2020     First Version
+///     1.1     31-Jul-2020     change output delimiter from # to | and move description field to last
 ///
 ///
 #ifndef __GEO_FEED_DBU_H__
@@ -52,7 +53,7 @@
 #define FLG_CMPL_FED            'N'
 
 #define ALL_PARTITION           "-2"
-#define EFIT_DELIM              '#'
+#define EFIT_DELIM              '|'
 #define FLG_EFIT_SID            'S'
 #define FLG_EFIT_SWID           'W'
 #define FLG_EFIT_CELL           'C'
