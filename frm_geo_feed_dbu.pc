@@ -1,0 +1,992 @@
+///
+///
+/// FACILITY    : db utility
+///
+/// FILE NAME   : geo_feed_dbu.pc
+///
+/// AUTHOR      : Thanakorn Nitipiromchai
+///
+/// CREATE DATE : 02-Mar-2020
+///
+/// CURRENT VERSION NO : 1.0
+///
+/// LAST RELEASE DATE  : 02-Mar-2020
+///
+/// MODIFICATION HISTORY :
+///     1.0     02-Mar-2020     First Version
+///
+///
+#include <math.h>
+#include <sqlca.h>
+#include <sqlda.h>
+#include <sqlcpr.h>
+
+#include "frm_geo_feed_dbu.h"
+#include "snapfile.h"
+
+EXEC SQL INCLUDE SQLCA;
+
+int  gnDefRad = 30;
+int  gnCommitRec = 1000;
+char *pbuf_cell[SIZE_BUFF];
+
+FILE *gzFpErr = NULL;
+FILE *gzFpIgn = NULL;
+
+char gszErrFname[SIZE_BUFF];
+char gszRejFname[SIZE_BUFF];
+
+// MAX LAT  - 89-59-59 (N/S)
+// MAX LONG - 179-59-59 (E/W)
+
+void setCommitRec(int commit_cnt)
+{
+    gnCommitRec = (commit_cnt <= 0 ? gnCommitRec : commit_cnt);
+}
+
+void setDefRadius(int def_radius)
+{
+    gnDefRad = ( def_radius <= 0 ? gnDefRad : def_radius );
+}
+
+int connectDbErm(char *szDbUsr, char *szDbPwd, char *szDbSvr)
+{
+
+    int retry = 3;
+    int result = SUCCESS;
+
+    EXEC SQL DECLARE ERM_DB DATABASE;
+    do {
+        EXEC SQL CONNECT :szDbUsr IDENTIFIED BY :szDbPwd AT ERM_DB USING :szDbSvr;
+        if (sqlca.sqlcode == SUCCESS) {
+            return SUCCESS;
+        }
+        else {
+            trimStr(sqlca.sqlerrm.sqlerrmc);
+            writeLog(LOG_ERR, "connectDbErm failed ora(%d) - %s", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+            result = FAILED;
+            sleep(60);
+        }
+        retry--;
+        writeLog(LOG_INF, "retry connecting to %s ...", szDbSvr);
+    } while ( retry > 0 );
+
+    return result;
+
+}
+
+void disconnErm()
+{
+
+    EXEC SQL AT ERM_DB COMMIT WORK RELEASE;
+    writeLog(LOG_INF, "disconnected from ERM");
+
+}
+
+int updateProcRecord(const char *tab_name, const char *row_id, char feed_flg)
+{
+    VARCHAR szUSql[SIZE_BUFF];
+    int result = SUCCESS;
+
+    if ( strlen(row_id) <= 0 ) {
+        return result;
+    }
+    sprintf((char*)szUSql.arr, "UPDATE %s SET LAST_UPDATE = SYSDATE, IS_UPDATED = '%c' WHERE ROWID = '%s'", tab_name, feed_flg, row_id);
+    szUSql.len = strlen((char *)szUSql.arr);
+    writeLog(LOG_DB1, "%s", szUSql.arr);
+
+    //EXEC SQL AT ERM_DB EXECUTE IMMEDIATE :szUSql;
+    EXEC SQL AT ERM_DB PREPARE UDP FROM :szUSql;
+    EXEC SQL AT ERM_DB EXECUTE UDP;
+
+    if ( sqlca.sqlcode != SUCCESS ) {
+        trimStr(sqlca.sqlerrm.sqlerrmc);
+        writeLog(LOG_ERR, "updateProcRecord: unable to update %s process flag(%c) @ rowid %s, Ora(%d) - %s", tab_name, feed_flg, row_id, sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        result = FAILED;
+    }
+    return result;
+}
+
+void procInsUpd(char inp_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
+{
+    insUpdCellAreaTH();
+    insUpdCellAreaEN();
+    insUpdCellSetAndCell(inp_ini, comm_ini);
+}
+
+#if 0
+int cksum_pass(const char *file)
+{
+    char cksum_prev[SIZE_ITEM_M], cksum_curr[SIZE_ITEM_M], cmd[SIZE_ITEM_L], out[100];
+    char tmp_file[SIZE_ITEM_L], f_dir[SIZE_ITEM_M], f_name[SIZE_ITEM_M];
+    FILE *ifp = NULL;
+
+    if ( access(file, F_OK|R_OK) != SUCCESS ) {
+        writeLog(LOG_ERR, "cksum_pass: unable to access file %s (%s)\n", file, strerror(errno));
+        return FAILED;
+    }
+    memset(cmd, 0x00, sizeof(cmd));
+    memset(tmp_file, 0x00, sizeof(tmp_file));
+    memset(f_dir, 0x00, sizeof(f_dir));
+    memset(f_name, 0x00, sizeof(f_name));
+    memset(cksum_prev, 0x00, sizeof(cksum_prev));
+    memset(cksum_curr, 0x00, sizeof(cksum_curr));
+
+    strcpy(tmp_file, file);
+    strcpy(f_dir, dirname(tmp_file));
+    strcpy(tmp_file, file);
+    strcpy(f_name, basename(tmp_file));
+
+    sprintf(cksum_prev, "%s/.%s.cks_prev", f_dir, f_name);
+    sprintf(cksum_curr, "%s/.%s.cks_curr", f_dir, f_name);
+
+    sprintf(cmd, "cksum %s 2>/dev/null > %s", file, cksum_curr);
+    system(cmd);
+    if ( access(cksum_prev, F_OK|R_OK) == SUCCESS ) {
+        sprintf(cmd, "diff %s %s 2>/dev/null", cksum_prev, cksum_curr);
+        if ( (ifp = popen(cmd, "r")) == NULL ) {
+            writeLog(LOG_ERR, "cksum_pass: cannot get compare cksum %s", strerror(errno));
+            return FAILED;
+        }
+        memset(out, 0x00, sizeof(out));
+        fgets(out, sizeof(out), ifp);
+        trimStr(out);
+        pclose(ifp);
+
+        if ( strlen(out) <= 1 ) {
+            return FAILED;
+        }
+    }
+    sprintf(cmd, "mv %s %s", cksum_curr, cksum_prev);
+    system(cmd);
+    return SUCCESS;
+
+}
+#endif
+
+void insUpdCellAreaTH()
+{
+    char errstr[SIZE_ITEM_M];
+    VARCHAR szSql[SIZE_BUFF_2X];
+
+    writeLog(LOG_INF, "processing cell_area from province_master ...");
+
+    strcpy((char*)szSql.arr, "MERGE INTO CELL_AREA tgt USING " \
+            "( SELECT ('TH' || UPPER(SHORTCODE)) AS SID " \
+                ", PROV_NAME_TH, UPPER(PROV_NAME_EN) AS PR_EN, RADIUS " \
+                ", (LAT2 || '-' || LAT3 || '-' || LAT4 || LAT1) AS LAT " \
+                ", (LNG2 || '-' || LNG3 || '-' || LNG4 || LNG1) AS LNG FROM PROVINCE_MASTER ) src " \
+            "ON (tgt.SID = src.SID) WHEN MATCHED THEN UPDATE SET " \
+            "tgt.DESC_TH = src.PROV_NAME_TH, " \
+            "tgt.DESC_EN = src.PR_EN, " \
+            "tgt.LATITUDE = src.LAT, " \
+            "tgt.LONGITUDE = src.LNG, " \
+            "tgt.RADIUS = src.RADIUS, " \
+            "tgt.IS_UPDATED = 'Y', " \
+            "tgt.LAST_UPDATE = SYSDATE " \
+            "WHERE " \
+            "(tgt.DESC_TH <> src.PROV_NAME_TH) " \
+            "OR (tgt.DESC_EN <> src.PR_EN) " \
+            "OR (tgt.LATITUDE <> src.LAT) " \
+            "OR (tgt.LONGITUDE<> src.LNG) " \
+            "OR (tgt.RADIUS<> src.RADIUS) " \
+            "WHEN NOT MATCHED " \
+            "THEN INSERT (tgt.SID, tgt.DESC_TH, tgt.DESC_EN, tgt.LATITUDE, tgt.LONGITUDE, tgt.RADIUS, tgt.IS_UPDATED, tgt.LAST_UPDATE) " \
+            "VALUES (src.SID, src.PROV_NAME_TH, src.PR_EN, src.LAT, src.LNG, src.RADIUS, 'Y', SYSDATE) ");
+    szSql.len = strlen((char*)szSql.arr);
+    writeLog(LOG_DB1, (char*)szSql.arr);
+
+    EXEC SQL AT ERM_DB EXECUTE IMMEDIATE :szSql;
+    //EXEC SQL AT ERM_DB PREPARE CS FROM :szSql;
+    //EXEC SQL AT ERM_DB EXECUTE CS;
+    if ( sqlca.sqlcode == SUCCESS ) {
+        writeLog(LOG_INF, "insUpdCellArea(TH): success");
+    }
+    else {
+        memset(errstr, 0x00, sizeof(errstr));
+        sprintf(errstr, "%d (%s)", sqlca.sqlcode, trimStr(sqlca.sqlerrm.sqlerrmc));
+        writeLog(LOG_ERR, "insUpdCellArea(TH): %s", errstr);
+    }
+    EXEC SQL AT ERM_DB COMMIT WORK;
+
+}
+
+void insUpdCellAreaEN()
+{
+    char errstr[SIZE_ITEM_M];
+    VARCHAR szSql[SIZE_BUFF_2X];
+
+    writeLog(LOG_INF, "processing cell_area from country_master ...");
+
+    strcpy((char*)szSql.arr, "MERGE INTO CELL_AREA tgt USING " \
+            "( SELECT (UPPER(REGION_CODE) || UPPER(COUNTRY_ABBR)) AS SID " \
+                ", UPPER(COUNTRY_NAME) AS CNTRY_NAME " \
+                ", MIN(RADIUS) AS RADIUS " \
+                ", MAX(LAT2 || '-' || LAT3 || '-' || LAT4 || LAT1) AS LAT " \
+                ", MAX(LNG2 || '-' || LNG3 || '-' || LNG4 || LNG1) AS LNG " \
+                "FROM COUNTRY_MASTER GROUP BY (UPPER(REGION_CODE) || UPPER(COUNTRY_ABBR)), UPPER(COUNTRY_NAME) ) src " \
+            "ON (tgt.SID = src.SID) WHEN MATCHED THEN UPDATE SET " \
+            "tgt.DESC_EN = src.CNTRY_NAME, " \
+            "tgt.LATITUDE = src.LAT, " \
+            "tgt.LONGITUDE = src.LNG, " \
+            "tgt.RADIUS = src.RADIUS, " \
+            "tgt.IS_UPDATED = 'Y', " \
+            "tgt.LAST_UPDATE = SYSDATE " \
+            "WHERE " \
+            "(tgt.DESC_EN <> src.CNTRY_NAME) " \
+            "OR (tgt.LATITUDE <> src.LAT) " \
+            "OR (tgt.LONGITUDE<> src.LNG) " \
+            "OR (tgt.RADIUS<> src.RADIUS) " \
+            "WHEN NOT MATCHED " \
+            "THEN INSERT (tgt.SID, tgt.DESC_EN, tgt.LATITUDE, tgt.LONGITUDE, tgt.RADIUS, tgt.IS_UPDATED, tgt.LAST_UPDATE) " \
+            "VALUES (src.SID, src.CNTRY_NAME, src.LAT, src.LNG, src.RADIUS, 'Y', SYSDATE) ");
+    szSql.len = strlen((char*)szSql.arr);
+    writeLog(LOG_DB1, (char*)szSql.arr);
+
+    EXEC SQL AT ERM_DB EXECUTE IMMEDIATE :szSql;
+    //EXEC SQL AT ERM_DB PREPARE CS FROM :szSql;
+    //EXEC SQL AT ERM_DB EXECUTE CS USING :pbuf_cell[E_PROVINCE];
+    if ( sqlca.sqlcode == SUCCESS ) {
+        writeLog(LOG_INF, "insUpdCellArea(EN): success");
+    }
+    else {
+        memset(errstr, 0x00, sizeof(errstr));
+        sprintf(errstr, "%d (%s)", sqlca.sqlcode, trimStr(sqlca.sqlerrm.sqlerrmc));
+        writeLog(LOG_ERR, "insUpdCellArea(EN): %s", errstr);
+    }
+    EXEC SQL AT ERM_DB COMMIT WORK;
+
+}
+
+void insUpdCellSetAndCell(char inp_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
+{
+    FILE *sfp = NULL, *ifp = NULL;
+    char snapfile[SIZE_ITEM_L], snp_line[SIZE_BUFF];
+    char inp_file[SIZE_ITEM_X], inp_line[SIZE_BUFF], tmp_line[SIZE_BUFF], ori_line[SIZE_BUFF], err_ign_info[SIZE_BUFF];
+    char errstr[SIZE_ITEM_M], cell_type[3+1], fname_ign[SIZE_ITEM_X], fname_err[SIZE_ITEM_X];
+    char *snp_inf[SIZE_BUFF];
+    int fcnt = 0;
+    int rdrec_sum = 0, success_sum = 0, error_sum = 0, ignor_sum = 0, file_cnt = 0;
+    int rdrec_cnt = 0, success_cnt = 0, error_cnt = 0, ignor_cnt = 0, err_or_ign = 0;
+
+
+    memset(snapfile, 0x00, sizeof(snapfile));
+    memset(snp_line, 0x00, sizeof(snp_line));
+    memset(inp_file, 0x00, sizeof(inp_file));
+    memset(ori_line, 0x00, sizeof(ori_line));
+    memset(inp_line, 0x00, sizeof(inp_line));
+    memset(tmp_line, 0x00, sizeof(tmp_line));
+    sprintf(snapfile, "%s/.%s.snap", comm_ini[E_TMP_DIR], _APP_NAME_);
+    if ( listSnapFilesSimple(snapfile, inp_ini[E_INP_CONTAIN], inp_ini[E_INP_SUFFIX], inp_ini[E_INP_DIR], 1) <= 0 ) {
+        //writeLog(LOG_WRN, "no new cell file to be updated");
+        return;
+    }
+
+    if ( getFreshSnap(snapfile) <= 0 ) {
+        writeLog(LOG_WRN, "no new cell file to be updated");
+        return;
+    }
+
+    if ( (sfp = fopen(snapfile, "r")) == NULL ) {
+        writeLog(LOG_ERR, "cannot open %s for reading (%s)", snapfile, strerror(errno));
+        return;
+    }
+    else {
+        memset(gszErrFname, 0x00, sizeof(gszErrFname));
+        memset(gszRejFname, 0x00, sizeof(gszRejFname));
+
+        while ( fgets(snp_line, sizeof(snp_line), sfp) ) {
+            trimStr(snp_line);
+            memset(snp_inf, 0x00, sizeof(snp_inf));
+            getTokenAll(snp_inf, E_NOF_SNP_INF, snp_line, SNAP_SEPS);
+
+            memset(inp_file, 0x00, sizeof(inp_file));
+            memset(cell_type, 0x00, sizeof(cell_type));
+
+            sprintf(inp_file, "%s/%s", snp_inf[E_SNP_PATH], snp_inf[E_SNP_FILE]);
+            int num = 3;
+            if ( snp_inf[E_SNP_FILE][0] >= '0' && snp_inf[E_SNP_FILE][0] <= '9') {
+                num = 2;
+            }
+            strncpy(cell_type, snp_inf[E_SNP_FILE], num);
+            writeLog(LOG_INF, "reading (%s) %s", cell_type, inp_file);
+
+            if ( (ifp = fopen(inp_file, "r")) == NULL ) {
+                writeLog(LOG_ERR, "cannot open %s for reading (%s)", inp_file, strerror(errno));
+                logState(inp_file);
+                continue;
+            }
+            else {
+                file_cnt++;
+                rdrec_cnt = 0;
+                error_cnt = 0;
+                ignor_cnt = 0;
+                success_cnt = 0;
+                while ( fgets(inp_line, sizeof(inp_line), ifp) ) {
+
+                    strcpy(ori_line, trimStr(inp_line));
+                    memset(pbuf_cell, 0x00, sizeof(pbuf_cell));
+                    if ( *inp_line == '"' && inp_line[strlen(inp_line)-1] == '"') {
+                        strcpy(tmp_line, strReplaceAll(inp_line, "\",\"", "|"));
+                        strcpy(inp_line, strReplaceAll(tmp_line, "\"", ""));
+                    }
+                    rdrec_cnt++;
+//printf("rdline = '%s'\n\t", inp_line);
+                    //strcpy(tmp_line, inp_line);
+                    fcnt = getTokenAll(pbuf_cell, E_NOF_CELL_ID, inp_line, '|');
+
+                    memset(fname_ign, 0x00, sizeof(fname_ign));
+                    memset(fname_err, 0x00, sizeof(fname_err));
+
+                    sprintf(fname_ign, "%s/%s%s", comm_ini[E_IGN_DIR], snp_inf[E_SNP_FILE], SUFF_IGN);
+                    sprintf(fname_err, "%s/%s%s", comm_ini[E_ERR_DIR], snp_inf[E_SNP_FILE], SUFF_ERR);
+//int ii = 0;
+//for( ii=0; ii<E_NOF_CELL_ID; ii++)
+//printf("%s ", pbuf_cell[ii]);
+//printf("\n");
+                    memset(err_ign_info, 0x00, sizeof(err_ign_info));
+                    if ( fcnt < E_NOF_CELL_ID ) {
+                        sprintf(err_ign_info, "invalid num field %d expected %d | line: %d | %s\n", fcnt, E_NOF_CELL_ID, rdrec_cnt, ori_line);
+                        wrtErrInfo(fname_err, err_ign_info, ( comm_ini[E_ENB_ERR_FILE][0] == 'Y' ? 1 : 0 ));
+                        error_cnt++;
+                        continue;
+                    }
+
+                    if ( strncmp(pbuf_cell[E_CELL_STAT], "ACTIV", 5) != 0 ) {
+                        sprintf(err_ign_info, "inactive (%s) | line: %d | %s\n", pbuf_cell[E_CELL_STAT], rdrec_cnt, ori_line);
+                        wrtIgnRecord(fname_ign, err_ign_info, ( comm_ini[E_ENB_ERR_FILE][0] == 'Y' ? 1 : 0 ));
+                        ignor_cnt++;
+                        continue;
+                    }
+
+                    err_or_ign = 0;
+                    if ( validateGeoField(err_or_ign, err_ign_info) != SUCCESS ) {
+                        sprintf(err_ign_info, "%s %d | %s\n", err_ign_info, rdrec_cnt, ori_line);
+                        if ( err_or_ign == IS_ERR ) {
+                            wrtErrInfo(fname_ign, err_ign_info, ( comm_ini[E_ENB_ERR_FILE][0] == 'Y' ? 1 : 0 ));
+                            ignor_cnt++;
+                        }
+                        else {
+                            wrtIgnRecord(fname_err, err_ign_info, ( comm_ini[E_ENB_ERR_FILE][0] == 'Y' ? 1 : 0 ));
+                            error_cnt++;
+                        }
+                        continue;
+                    }
+
+                    insUpdCellSet(errstr);
+                    if ( insUpdCell(cell_type, errstr) == SUCCESS ) {
+                        if ( ++success_cnt % gnCommitRec == 0 ) {
+                            writeLog(LOG_INF, "insUpdCellSetAndCell: success/commit %d", success_cnt);
+                            EXEC SQL AT ERM_DB COMMIT;
+                        }
+                    }
+                    else {
+                        if ( ++error_cnt > NUM_ERR_ALLOW ) {
+                            EXEC SQL AT ERM_DB COMMIT;
+                            writeLog(LOG_ERR, "insUpdCellSetAndCell: last error before stop: %s", errstr);
+                            writeLog(LOG_ERR, "insUpdCellSetAndCell: error %d exceeded %d, stop loading", error_cnt, NUM_ERR_ALLOW);
+                            break;
+                        }
+                    }
+                }
+
+                logState(inp_file);
+                fclose(ifp);    ifp = NULL;
+
+                rdrec_sum += rdrec_cnt;
+                success_sum += success_cnt;
+                error_sum += error_cnt;
+                ignor_sum += ignor_cnt;
+
+                writeLog(LOG_INF, "insUpdCellSetAndCell: cell read %d, error %d, ignore %d, success/commit %d", rdrec_cnt, error_cnt, ignor_cnt, success_cnt);
+
+                if ( gzFpErr != NULL ) {
+                    fclose(gzFpErr);    gzFpErr = NULL;
+                }
+                if ( gzFpIgn != NULL ) {
+                    fclose(gzFpIgn);    gzFpIgn = NULL;
+                }
+
+            }
+            if ( comm_ini[E_BCK_INP][0] == 'Y' ) {
+                char cmd[SIZE_ITEM_L];
+                memset(cmd, 0x00, sizeof(cmd));
+                sprintf(cmd, "cp -p %s %s", inp_file, comm_ini[E_BCK_INP_DIR]);
+                system(cmd);
+                writeLog(LOG_INF, "backup input %s to %s", inp_file, comm_ini[E_BCK_INP_DIR]);
+            }
+        }
+        writeLog(LOG_INF, "insUpdCellSetAndCell: read %d files; summary => cell read %d, error %d, ignore %d, success/commit %d", file_cnt, rdrec_sum, error_sum, ignor_sum, success_sum);
+
+        fclose(sfp);
+        sfp = NULL;
+    }
+
+}
+
+int insUpdCellSet(char *errstr)
+{
+    VARCHAR szSql[SIZE_BUFF_2X];
+    static int init_cs = 0;
+
+    if ( init_cs == 0 ) {
+        sprintf((char*)szSql.arr, "MERGE INTO CELL_SET tgt USING " \
+            "(SELECT SID, LATITUDE, LONGITUDE, NVL(RADIUS, :v1) RADIUS, :v2 || '-' || :v3 DESCR, :v4 || '-' || :v5 SWITCH_NO FROM CELL_AREA WHERE DESC_TH = :v6) src " \
+                "ON (tgt.SID = src.SID AND tgt.SWITCH_NO = src.DESCR) " \
+             "WHEN MATCHED " \
+                "THEN UPDATE SET " \
+                    "tgt.DESCRIPTION = src.DESCR, " \
+                    "tgt.LATITUDE = src.LATITUDE, " \
+                    "tgt.LONGITUDE = src.LONGITUDE, " \
+                    "tgt.RADIUS = src.RADIUS, " \
+                    "tgt.IS_UPDATED = 'Y', " \
+                    "tgt.LAST_UPDATE = SYSDATE " \
+                "WHERE " \
+                    "(tgt.DESCRIPTION <> src.DESCR) " \
+                    "OR (tgt.LATITUDE <> src.LATITUDE) " \
+                    "OR (tgt.LONGITUDE <> src.LONGITUDE) " \
+                    "OR (tgt.RADIUS <> src.RADIUS) " \
+             "WHEN NOT MATCHED " \
+                "THEN INSERT (tgt.FRM_SWID, tgt.SID, tgt.SWITCH_NO, tgt.DESCRIPTION, tgt.LATITUDE, tgt.LONGITUDE, tgt.RADIUS, tgt.IS_UPDATED, tgt.LAST_UPDATE) " \
+                    "VALUES (TRIM(TO_CHAR(SEQ_SWID.NEXTVAL,'0000000')), src.SID, src.SWITCH_NO, src.DESCR, src.LATITUDE, src.LONGITUDE, src.RADIUS, 'Y', SYSDATE) ");
+                //, gnDefRad, pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL], pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL], pbuf_cell[E_PROVINCE]);
+                //, gnDefRad, pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL], pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL]);
+        szSql.len = strlen((char*)szSql.arr);
+        writeLog(LOG_DB1, (char*)szSql.arr);
+
+        //EXEC SQL AT ERM_DB EXECUTE IMMEDIATE :szSql;
+        EXEC SQL AT ERM_DB PREPARE UCS FROM :szSql;
+        init_cs = 1;
+    }
+    //EXEC SQL AT ERM_DB EXECUTE CS USING :pbuf_cell[E_PROVINCE];
+    EXEC SQL AT ERM_DB EXECUTE UCS USING :gnDefRad, :pbuf_cell[E_AMPHUR], :pbuf_cell[E_TUMBOL], :pbuf_cell[E_AMPHUR], :pbuf_cell[E_TUMBOL], :pbuf_cell[E_PROVINCE];
+    if ( sqlca.sqlcode == SUCCESS ) {
+        return SUCCESS;
+    }
+    else {
+        sprintf(errstr, "%d (%s)", sqlca.sqlcode, trimStr(sqlca.sqlerrm.sqlerrmc));
+        return FAILED;
+    }
+}
+
+int insUpdCell(const char *cell_type, char *errstr)
+{
+    char szLat[10], szLong[10];
+    char szCgi[31], szCellId[26];
+    VARCHAR szSql[SIZE_BUFF_2X];
+    static int init = 0;
+
+    memset(szLat, 0x00, sizeof(szLat));
+    memset(szLong, 0x00, sizeof(szLong));
+    memset(szCgi, 0x00, sizeof(szCgi));
+    memset(szCellId, 0x00, sizeof(szCellId));
+
+    sprintf(szLat, "%02d-%02d-%02d%s", atoi(pbuf_cell[E_LAT2]), atoi(pbuf_cell[E_LAT3]), atoi(pbuf_cell[E_LAT4]), pbuf_cell[E_LAT1]);
+    sprintf(szLong, "%02d-%02d-%02d%s", atoi(pbuf_cell[E_LONG2]), atoi(pbuf_cell[E_LONG3]), atoi(pbuf_cell[E_LONG4]), pbuf_cell[E_LONG1]);
+    strcpy(szCellId, pbuf_cell[E_CELL_CODE]);
+    strcpy(szCgi, strReplaceAll(pbuf_cell[E_CGI], "-", ""));
+//printf("%s\t%s\n", szLat, szLong);
+    //gnDefRad
+
+    if ( init == 0 ) {
+    sprintf((char*)szSql.arr, "MERGE INTO CELL tgt USING " \
+"(SELECT SID, SWITCH_NO, RADIUS, :c1 CELL_ID, :c2 || '-' || :c3  DESCRIPTION, :c4 LATITUDE, :c5 LONGITUDE, :c6 CGI FROM CELL_SET WHERE SWITCH_NO = :c7 || '-' || :c8 ) src " \
+            "ON (tgt.SID = src.SID AND tgt.SWITCH_NO = src.SWITCH_NO AND tgt.CELL_ID = src.CELL_ID) " \
+        "WHEN MATCHED " \
+        "THEN UPDATE SET " \
+                "tgt.DESCRIPTION = src.DESCRIPTION, " \
+                "tgt.LATITUDE = src.LATITUDE, " \
+                "tgt.LONGITUDE = src.LONGITUDE, " \
+                "tgt.RADIUS = src.RADIUS, " \
+                "tgt.CGI = src.CGI, " \
+                "tgt.IS_UPDATED = 'Y', " \
+                "tgt.LAST_UPDATE = SYSDATE " \
+            "WHERE " \
+                "tgt.DESCRIPTION <> src.DESCRIPTION " \
+                "OR tgt.LATITUDE <> src.LATITUDE " \
+                "OR tgt.LONGITUDE <> src.LONGITUDE " \
+                "OR tgt.RADIUS <> src.RADIUS " \
+                "OR tgt.CGI <> src.CGI " \
+        "WHEN NOT MATCHED " \
+            "THEN INSERT (tgt.FRM_CELL_ID, tgt.SID, tgt.SWITCH_NO, tgt.CELL_ID, tgt.DESCRIPTION, tgt.LATITUDE, tgt.LONGITUDE, tgt.CGI, tgt.RADIUS, tgt.IS_UPDATED, tgt.LAST_UPDATE) " \
+            "VALUES (TRIM(TO_CHAR(SEQ_CID.NEXTVAL,'0XXXX')), src.SID, src.SWITCH_NO, src.CELL_ID, src.DESCRIPTION, src.LATITUDE, src.LONGITUDE, src.CGI, src.RADIUS, 'Y', SYSDATE) ");
+        //, szCellId, cell_type, pbuf_cell[E_SITE_NAME], szLat, szLong, szCgi, pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL]);
+    szSql.len = strlen((char*)szSql.arr);
+    writeLog(LOG_DB1, (char*)szSql.arr);
+
+    //EXEC SQL AT ERM_DB EXECUTE IMMEDIATE :szSql;
+    EXEC SQL AT ERM_DB PREPARE CELL FROM :szSql;
+    init = 1;
+    }
+    EXEC SQL AT ERM_DB EXECUTE CELL USING :szCellId, :cell_type, :pbuf_cell[E_SITE_NAME], :szLat, :szLong, :szCgi, :pbuf_cell[E_AMPHUR], :pbuf_cell[E_TUMBOL];
+    if ( sqlca.sqlcode == SUCCESS ) {
+        return SUCCESS;
+    }
+    else {
+        sprintf(errstr, "%d (%s)", sqlca.sqlcode, trimStr(sqlca.sqlerrm.sqlerrmc));
+        return FAILED;
+    }
+}
+
+int validateGeoField(int err_or_ign, char *info)
+{
+    int result = SUCCESS;
+    if ( strcmp(pbuf_cell[E_LAT1], "N") && strcmp(pbuf_cell[E_LAT1], "S") ) {     //  (Direction N/S)
+        sprintf(info, "invalid lat_1 (%s) | line: ", pbuf_cell[E_LAT1]);
+        err_or_ign = IS_ERR;
+        result = FAILED;
+    }
+    else if ( strcmp(pbuf_cell[E_LONG1], "E") && strcmp(pbuf_cell[E_LONG1], "W") ) {   // (Direction E/W)
+        sprintf(info, "invalid long_1 (%s) | line: ", pbuf_cell[E_LONG1]);
+        err_or_ign = IS_ERR;
+        result = FAILED;
+    }
+    else {
+        int deg, min, sec;
+        deg = atoi(pbuf_cell[E_LAT2]);  // (Degree 0-89)
+        min = atoi(pbuf_cell[E_LAT3]);  // (Minute 0-59)
+        sec = atoi(pbuf_cell[E_LAT4]);  // (Second 0-59)
+        if ( deg < 0 || deg > 89 ) {
+            sprintf(info, "invalid lat_2 (%s) | line: ", pbuf_cell[E_LAT2]);
+            err_or_ign = IS_ERR;
+            result = FAILED;
+        }
+        else if ( min < 0 || min > 59 ) {
+            sprintf(info, "invalid lat_3 (%s) | line: ", pbuf_cell[E_LAT3]);
+            err_or_ign = IS_ERR;
+            result = FAILED;
+        }
+        else if ( sec < 0 || sec > 59 ) {
+            sprintf(info, "invalid lat_4 (%s) | line: ", pbuf_cell[E_LAT4]);
+            err_or_ign = IS_ERR;
+            result = FAILED;
+        }
+        else {
+            deg = atoi(pbuf_cell[E_LONG2]);  // (Degree 0-179)
+            min = atoi(pbuf_cell[E_LONG3]);  // (Minute 0-59)
+            sec = atoi(pbuf_cell[E_LONG4]);  // (Second 0-59)
+            if ( deg < 0 || deg > 179 ) {
+                sprintf(info, " invalid long_2 (%s) | line: ", pbuf_cell[E_LONG2]);
+                err_or_ign = IS_ERR;
+                result = FAILED;
+            }
+            else if ( min < 0 || min > 59 ) {
+                sprintf(info, "invalid long_3 (%s) | line: ", pbuf_cell[E_LONG3]);
+                err_or_ign = IS_ERR;
+                result = FAILED;
+            }
+            else if ( sec < 0 || sec > 59 ) {
+                sprintf(info, "invalid long_4 (%s) | line: ", pbuf_cell[E_LONG4]);
+                err_or_ign = IS_ERR;
+                result = FAILED;
+            }
+        }
+    }
+    return result;
+}
+
+void wrtErrInfo(const char *fname, const char *rec_inf, int wrt)
+{
+    if ( wrt == 0 ) {
+        return;
+    }
+
+    if ( strcmp(gszErrFname, fname) != 0 ) {
+        if ( gszErrFname[0] != '\0' && gzFpErr != NULL ) {
+            fclose(gzFpErr); gzFpErr = NULL;
+        }
+        gzFpErr = fopen(fname, "w");
+        strcpy(gszErrFname, fname);
+    }
+
+    if ( gzFpErr != NULL ) {
+        fprintf(gzFpErr, rec_inf);
+    }
+
+}
+
+void wrtIgnRecord(const char *fname, const char *rec_inf, int wrt)
+{
+    if ( wrt == 0 ) {
+        return;
+    }
+
+    if ( strcmp(gszRejFname, fname) != 0 ) {
+        if ( gszRejFname[0] != '\0' && gzFpIgn != NULL ) {
+            fclose(gzFpIgn); gzFpErr = NULL;
+        }
+        gzFpIgn = fopen(fname, "w");
+        strcpy(gszRejFname, fname);
+    }
+
+    if ( gzFpIgn != NULL ) {
+        fprintf(gzFpIgn, rec_inf);
+    }
+}
+
+
+void procWrtOuput(char out_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
+{
+    wrtCellArea(out_ini, comm_ini);
+    wrtCellSet(out_ini, comm_ini);
+    wrtCell(out_ini, comm_ini);
+}
+
+void wrtCellArea(char out_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
+{
+    VARCHAR szCellArea[SIZE_BUFF];
+    FILE *ofile = NULL, *mfile = NULL;
+    char tabname[30], file_name[SIZE_ITEM_L], full_name[SIZE_ITEM_L], cmd[SIZE_ITEM_L];
+    int rdRec = 0;
+    char szSid[6+1], szDesc[250+1], szLat[10+1], szLong[10+1], szRowId[SIZE_ITEM_T];
+    char map_fname[SIZE_ITEM_L], szGeoCdrMap[] = "CELLAREA_GEO.DAT";
+    int nRad;
+
+    memset(tabname, 0x00, sizeof(tabname));
+    strcpy(tabname, "CELL_AREA");
+
+    writeLog(LOG_INF, "preparing %s file for efit ...", tabname);
+    memset(file_name, 0x00, sizeof(file_name));
+    memset(full_name, 0x00, sizeof(full_name));
+    sprintf(file_name, "%s_%s%s", out_ini[E_OUT_PRE_SID], getSysDTM(DTM_DATE_TIME), out_ini[E_OUT_SUFF]);
+    sprintf(full_name, "%s/%s.tmp", comm_ini[E_TMP_DIR], file_name);
+    if ( (ofile = fopen(full_name, "a")) == NULL ) {
+        writeLog(LOG_ERR, "cannot open append %s (%s)", full_name, strerror(errno));
+        return;
+    }
+
+    memset(map_fname, 0x00, sizeof(map_fname));
+    sprintf(map_fname, "%s/%s.tmp", out_ini[E_OUT_CDRFEED_DIR], szGeoCdrMap);
+    if ( (mfile = fopen(map_fname, "a")) == NULL ) {
+        writeLog(LOG_ERR, "cannot open append %s (%s)", map_fname, strerror(errno));
+        fclose(ofile);
+        return;
+    }
+
+    sprintf((char*)szCellArea.arr, "SELECT SID, (CASE WHEN DESC_TH IS NOT NULL THEN DESC_TH ELSE NVL(DESC_EN, 'NA') END) AS DESCR, LATITUDE, LONGITUDE, RADIUS, ROWID FROM %s WHERE IS_UPDATED = '%c'", tabname, FLG_FOR_LOAD);
+    szCellArea.len = strlen((char*)szCellArea.arr);
+    writeLog(LOG_DB1, (char*)szCellArea.arr);
+
+    EXEC SQL AT ERM_DB PREPARE orcSidStmt FROM :szCellArea;
+    EXEC SQL AT ERM_DB DECLARE orcSidCur CURSOR FOR orcSidStmt;
+    EXEC SQL AT ERM_DB OPEN orcSidCur;
+
+    if ( sqlca.sqlcode < SUCCESS ) {
+        trimStr(sqlca.sqlerrm.sqlerrmc);
+        writeLog(LOG_ERR, "wrtCellArea: unable to open orcSidCur on %s table, Ora(%d) - %s", tabname, sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        EXEC SQL AT ERM_DB CLOSE orcSidCur;
+    }
+    else {
+        writeLog(LOG_INF, "writing %s output file", tabname);
+        while ( TRUE ) {
+            memset(szSid, 0x00, sizeof(szSid));
+            memset(szDesc, 0x00, sizeof(szDesc));
+            memset(szLat, 0x00, sizeof(szLat));
+            memset(szLong, 0x00, sizeof(szLong));
+            memset(szRowId, 0x00, sizeof(szRowId));
+            EXEC SQL AT ERM_DB FETCH orcSidCur INTO :szSid, :szDesc, :szLat, :szLong, :nRad, :szRowId;
+            if ( sqlca.sqlcode != SUCCESS ) {
+                if ( sqlca.sqlcode != NOT_FOUND ) {
+                    trimStr(sqlca.sqlerrm.sqlerrmc);
+                    writeLog(LOG_ERR, "wrtCellArea: query error on %s table, Ora(%d) - %s", tabname, sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+                }
+                break;
+            }
+            else {
+                trimStr(szSid);
+                trimStr(szDesc);
+                trimStr(szLat);
+                trimStr(szLong);
+                trimStr(szRowId);
+                updateProcRecord(tabname, szRowId, FLG_CMPL_FED);
+                fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%d\n", FLG_EFIT_SID, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szDesc, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad);
+                fprintf(mfile, "%s|%s\n", szDesc, szSid);
+                if ( ++rdRec % gnCommitRec == 0 ) {
+                    writeLog(LOG_INF, "%d %s records written/committed", rdRec, tabname);
+                    fflush(ofile);
+                    fflush(mfile);
+                    EXEC SQL AT ERM_DB COMMIT;
+                }
+            }
+        }
+        EXEC SQL AT ERM_DB CLOSE orcSidCur;
+        EXEC SQL AT ERM_DB COMMIT;
+    }
+
+    fclose(ofile);
+    fclose(mfile);
+    if ( rdRec <= 0 ) {
+        unlink(full_name);
+        unlink(map_fname);
+        writeLog(LOG_WRN, "no new output record from %s", tabname);
+    }
+    else {
+        memset(cmd, 0x00, sizeof(cmd));
+        if ( comm_ini[E_BCK_OUT][0] == 'Y' ) {
+            sprintf(cmd, "cp -p %s %s/%s", full_name, comm_ini[E_BCK_OUT_DIR], file_name);
+            system(cmd);
+            writeLog(LOG_INF, "backup %s/%s", comm_ini[E_BCK_OUT_DIR], file_name);
+        }
+        memset(cmd, 0x00, sizeof(cmd));
+        sprintf(cmd, "mv %s %s/%s", full_name, out_ini[E_OUT_DIR], file_name);
+        system(cmd);
+        writeLog(LOG_INF, "output %s/%s (%d)", out_ini[E_OUT_DIR], file_name, rdRec);
+
+        memset(cmd, 0x00, sizeof(cmd));
+        sprintf(cmd, "mv %s %s/%s", map_fname, out_ini[E_OUT_CDRFEED_DIR], szGeoCdrMap);
+        system(cmd);
+        writeLog(LOG_INF, "output for cdr feed map (cell_area) file %s/%s (%d)", out_ini[E_OUT_CDRFEED_DIR], szGeoCdrMap, rdRec);
+    }
+
+}
+
+void wrtCellSet(char out_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
+{
+    VARCHAR szCellSet[SIZE_BUFF];
+    FILE *ofile = NULL;
+    char tabname[30], fname[SIZE_ITEM_L], file_name[SIZE_ITEM_L], cmd[SIZE_ITEM_L];
+    int rdRec = 0;
+    char szSid[6+1], szSwid[7+1], szDesc[250+1], szLat[10+1], szLong[10+1], szRowId[SIZE_ITEM_T];
+    int nRad;
+
+    memset(tabname, 0x00, sizeof(tabname));
+    strcpy(tabname, "CELL_SET");
+    writeLog(LOG_INF, "preparing %s file for efit ...", tabname);
+
+    memset(fname, 0x00, sizeof(fname));
+    memset(file_name, 0x00, sizeof(file_name));
+    sprintf(fname, "%s_%s%s", out_ini[E_OUT_PRE_SWID], getSysDTM(DTM_DATE_TIME), out_ini[E_OUT_SUFF]);
+    sprintf(file_name, "%s/%s", comm_ini[E_TMP_DIR], fname);
+    if ( (ofile = fopen(file_name, "a")) == NULL ) {
+        writeLog(LOG_ERR, "cannot open append %s (%s)", file_name, strerror(errno));
+        return;
+    }
+
+    sprintf((char*)szCellSet.arr, "SELECT SID, FRM_SWID, DESCRIPTION, LATITUDE, LONGITUDE, RADIUS, ROWID FROM %s WHERE IS_UPDATED = '%c'", tabname, FLG_FOR_LOAD);
+    szCellSet.len = strlen((char*)szCellSet.arr);
+    writeLog(LOG_DB1, (char*)szCellSet.arr);
+
+    EXEC SQL AT ERM_DB PREPARE orcSwidStmt FROM :szCellSet;
+    EXEC SQL AT ERM_DB DECLARE orcSwidCur CURSOR FOR orcSwidStmt;
+    EXEC SQL AT ERM_DB OPEN orcSwidCur;
+
+    if ( sqlca.sqlcode < SUCCESS ) {
+        trimStr(sqlca.sqlerrm.sqlerrmc);
+        writeLog(LOG_ERR, "wrtCellSet: unable to open orcSwidCur on %s table, Ora(%d) - %s", tabname, sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        EXEC SQL AT ERM_DB CLOSE orcSwidCur;
+    }
+    else {
+        writeLog(LOG_INF, "writing %s output file", tabname);
+        while ( TRUE ) {
+            memset(szSid, 0x00, sizeof(szSid));
+            memset(szSwid, 0x00, sizeof(szSwid));
+            memset(szDesc, 0x00, sizeof(szDesc));
+            memset(szLat, 0x00, sizeof(szLat));
+            memset(szLong, 0x00, sizeof(szLong));
+            memset(szRowId, 0x00, sizeof(szRowId));
+            EXEC SQL AT ERM_DB FETCH orcSwidCur INTO :szSid, :szSwid, :szDesc, :szLat, :szLong, :nRad, :szRowId;
+            if ( sqlca.sqlcode != SUCCESS ) {
+                if ( sqlca.sqlcode != NOT_FOUND  ) {
+                    trimStr(sqlca.sqlerrm.sqlerrmc);
+                    writeLog(LOG_ERR, "wrtCellSet: query error on %s table, Ora(%d) - %s", tabname, sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+                }
+                break;
+            }
+            else {
+                rdRec++;
+                trimStr(szSid);
+                trimStr(szSwid);
+                trimStr(szDesc);
+                trimStr(szLat);
+                trimStr(szLong);
+                trimStr(szRowId);
+                updateProcRecord(tabname, szRowId, FLG_CMPL_FED);
+                fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%s%c%d\n", FLG_EFIT_SWID, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szSwid, EFIT_DELIM, szDesc, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad);
+                if ( rdRec % gnCommitRec == 0 ) {
+                    writeLog(LOG_INF, "%d %s records written/committed", rdRec, tabname);
+                    fflush(ofile);
+                    EXEC SQL AT ERM_DB COMMIT;
+                }
+            }
+        }
+        EXEC SQL AT ERM_DB CLOSE orcSwidCur;
+        EXEC SQL AT ERM_DB COMMIT;
+    }
+
+    fclose(ofile);
+    if ( rdRec <= 0 ) {
+        unlink(file_name);
+        writeLog(LOG_WRN, "no new output record from %s", tabname);
+    }
+    else {
+        memset(cmd, 0x00, sizeof(cmd));
+        if ( comm_ini[E_BCK_OUT][0] == 'Y' ) {
+            sprintf(cmd, "cp -p %s %s", file_name, comm_ini[E_BCK_OUT_DIR]);
+            system(cmd);
+            writeLog(LOG_INF, "backup %s/%s", comm_ini[E_BCK_OUT_DIR], fname);
+        }
+        memset(cmd, 0x00, sizeof(cmd));
+        sprintf(cmd, "mv %s %s", file_name, out_ini[E_OUT_DIR]);
+        system(cmd);
+        writeLog(LOG_INF, "output %s/%s (%d)", out_ini[E_OUT_DIR], fname, rdRec);
+    }
+
+}
+
+void wrtCell(char out_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
+{
+    VARCHAR szCell[SIZE_BUFF];
+    FILE *ofile = NULL, *mfile = NULL;
+    char tabname[30], fname[SIZE_ITEM_L], file_name[SIZE_ITEM_L], cmd[SIZE_ITEM_L];
+    int oRec = 0, mRec = 0;
+    char szSid[6+1], szSwid[7+1], szId[5+1], szDesc[250+1], szLat[10+1], szLong[10+1], szRowId[SIZE_ITEM_T], szCgi[30+1], szFlag[2];
+    char map_fname[SIZE_ITEM_L], szGeoCdrMap[] = "CELL_GEO.DAT";
+    int nRad, nSeq;
+
+    memset(tabname, 0x00, sizeof(tabname));
+    strcpy(tabname, "CELL");
+    writeLog(LOG_INF, "preparing %s file for efit ...", tabname);
+    nSeq = 0;
+
+    memset(fname, 0x00, sizeof(fname));
+    memset(file_name, 0x00, sizeof(file_name));
+    sprintf(fname, "%s_%s_%03d%s", out_ini[E_OUT_PRE_CELL], getSysDTM(DTM_DATE_TIME), ++nSeq, out_ini[E_OUT_SUFF]);
+    sprintf(file_name, "%s/%s", comm_ini[E_TMP_DIR], fname);
+    if ( (ofile = fopen(file_name, "a")) == NULL ) {
+        writeLog(LOG_ERR, "cannot open append %s (%s)", file_name, strerror(errno));
+        return;
+    }
+
+    memset(map_fname, 0x00, sizeof(map_fname));
+    sprintf(map_fname, "%s/%s.tmp", out_ini[E_OUT_CDRFEED_DIR], szGeoCdrMap);
+    if ( (mfile = fopen(map_fname, "a")) == NULL ) {
+        writeLog(LOG_ERR, "cannot open append %s (%s)", map_fname, strerror(errno));
+        fclose(ofile);
+        return;
+    }
+
+    sprintf((char*)szCell.arr, "SELECT C.SID, S.FRM_SWID, C.FRM_CELL_ID, C.DESCRIPTION, C.LATITUDE, C.LONGITUDE, C.RADIUS, C.ROWID, C.CGI, C.IS_UPDATED " \
+                               "FROM %s C, CELL_SET S " \
+                               "WHERE C.SID = S.SID AND C.SWITCH_NO = S.SWITCH_NO ", tabname);
+    szCell.len = strlen((char*)szCell.arr);
+    writeLog(LOG_DB1, (char*)szCell.arr);
+
+    EXEC SQL AT ERM_DB PREPARE orcCellStmt FROM :szCell;
+    EXEC SQL AT ERM_DB DECLARE orcCellCur CURSOR FOR orcCellStmt;
+    EXEC SQL AT ERM_DB OPEN orcCellCur;
+
+    if ( sqlca.sqlcode < SUCCESS ) {
+        trimStr(sqlca.sqlerrm.sqlerrmc);
+        writeLog(LOG_ERR, "wrtCell: unable to open orcCellCur on %s table, Ora(%d) - %s", tabname, sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        EXEC SQL AT ERM_DB CLOSE orcCellCur;
+    }
+    else {
+        writeLog(LOG_INF, "writing %s output file", tabname);
+        while ( TRUE ) {
+            memset(szSid, 0x00, sizeof(szSid));
+            memset(szSwid, 0x00, sizeof(szSwid));
+            memset(szId, 0x00, sizeof(szId));
+            memset(szDesc, 0x00, sizeof(szDesc));
+            memset(szLat, 0x00, sizeof(szLat));
+            memset(szLong, 0x00, sizeof(szLong));
+            memset(szRowId, 0x00, sizeof(szRowId));
+            memset(szFlag, 0x00, sizeof(szFlag));
+            memset(szCgi, 0x00, sizeof(szCgi));
+            EXEC SQL AT ERM_DB FETCH orcCellCur INTO :szSid, :szSwid, :szId, :szDesc, :szLat, :szLong, :nRad, :szRowId, :szCgi, :szFlag;
+            if ( sqlca.sqlcode != SUCCESS ) {
+                if ( sqlca.sqlcode != NOT_FOUND ) {
+                    trimStr(sqlca.sqlerrm.sqlerrmc);
+                    writeLog(LOG_ERR, "wrtCell: query error on %s table, Ora(%d) - %s", tabname, sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+                }
+                break;
+            }
+            else {
+                mRec++;
+                trimStr(szSid);
+                trimStr(szSwid);
+                trimStr(szId);
+                trimStr(szDesc);
+                trimStr(szLat);
+                trimStr(szLong);
+                trimStr(szRowId);
+                trimStr(szFlag);
+                trimStr(szCgi);
+                if ( *szFlag == FLG_FOR_LOAD ) {
+                    oRec++;
+                    updateProcRecord(tabname, szRowId, FLG_CMPL_FED);
+                    fprintf(ofile, "%c%c%s%c%s%c%s%c%s%c%s%c%s%c%s%c%d\n", FLG_EFIT_CELL, EFIT_DELIM, ALL_PARTITION, EFIT_DELIM, szSid, EFIT_DELIM, szSwid, EFIT_DELIM, szId, EFIT_DELIM, szDesc, EFIT_DELIM, szLat, EFIT_DELIM, szLong, EFIT_DELIM, nRad);
+                    if ( oRec >= MAX_REC_PER_FILE ) {
+                        writeLog(LOG_INF, "max record per file reached %d, start next new file", oRec);
+                        fflush(ofile);
+                        fclose(ofile);
+                        ofile = NULL;
+                        // take backup ...
+                        memset(cmd, 0x00, sizeof(cmd));
+                        if ( comm_ini[E_BCK_OUT][0] == 'Y' ) {
+                            sprintf(cmd, "cp -p %s %s", file_name, comm_ini[E_BCK_OUT_DIR]);
+                            system(cmd);
+                            writeLog(LOG_INF, "backup %s/%s", comm_ini[E_BCK_OUT_DIR], fname);
+                        }
+                        // complete output file ...
+                        memset(cmd, 0x00, sizeof(cmd));
+                        sprintf(cmd, "mv %s %s", file_name, out_ini[E_OUT_DIR]);
+                        system(cmd);
+                        writeLog(LOG_INF, "output %s/%s (%d)", out_ini[E_OUT_DIR], fname, oRec);
+                        // open next new file ...
+                        memset(fname, 0x00, sizeof(fname));
+                        memset(file_name, 0x00, sizeof(file_name));
+                        sprintf(fname, "%s_%s_%03d%s", out_ini[E_OUT_PRE_CELL], getSysDTM(DTM_DATE_TIME), ++nSeq, out_ini[E_OUT_SUFF]);
+                        sprintf(file_name, "%s/%s", comm_ini[E_TMP_DIR], fname);
+                        oRec = 0;
+                        if ( (ofile = fopen(file_name, "a")) == NULL ) {
+                            writeLog(LOG_ERR, "cannot open append %s (%s)", file_name, strerror(errno));
+                            break;
+                        }
+                    }
+                }
+                fprintf(mfile, "%s|%s|%s|%s\n", szCgi, szId, szSwid, szSid);
+                if ( mRec % gnCommitRec == 0 ) {
+                    writeLog(LOG_INF, "%d %s records written/committed", mRec, tabname);
+                    fflush(ofile);
+                    fflush(mfile);
+                    EXEC SQL AT ERM_DB COMMIT;
+                }
+            }
+        }
+        EXEC SQL AT ERM_DB CLOSE orcCellCur;
+        EXEC SQL AT ERM_DB COMMIT;
+        fflush(ofile);
+        fflush(mfile);
+    }
+
+    fclose(ofile);
+    fclose(mfile);
+    if ( mRec <= 0 ) {
+        unlink(map_fname);
+        writeLog(LOG_WRN, "no output record from %s for cdr feed map file", tabname);
+    }
+    else {
+        memset(cmd, 0x00, sizeof(cmd));
+        sprintf(cmd, "mv %s %s/%s", map_fname, out_ini[E_OUT_CDRFEED_DIR], szGeoCdrMap);
+        system(cmd);
+        writeLog(LOG_INF, "output for cdr feed map file %s/%s (%d)", out_ini[E_OUT_CDRFEED_DIR], szGeoCdrMap, mRec);
+    }
+
+    if ( oRec <= 0 ) {
+        unlink(file_name);
+        writeLog(LOG_WRN, "no new output record from %s", tabname);
+    }
+    else {
+        memset(cmd, 0x00, sizeof(cmd));
+        if ( comm_ini[E_BCK_OUT][0] == 'Y' ) {
+            sprintf(cmd, "cp -p %s %s", file_name, comm_ini[E_BCK_OUT_DIR]);
+            system(cmd);
+            writeLog(LOG_INF, "backup %s/%s", comm_ini[E_BCK_OUT_DIR], fname);
+        }
+        memset(cmd, 0x00, sizeof(cmd));
+        sprintf(cmd, "mv %s %s", file_name, out_ini[E_OUT_DIR]);
+        system(cmd);
+        writeLog(LOG_INF, "output %s/%s (%d)", out_ini[E_OUT_DIR], fname, oRec);
+    }
+
+}
