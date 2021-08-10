@@ -30,9 +30,9 @@
 
 #include "minIni.h"
 #include "procsig.h"
-#include "geo_feed.h"
+#include "frm_geo_feed.h"
 #include "strlogutl.h"
-#include "geo_feed_dbu.h"
+#include "frm_geo_feed_dbu.h"
 #include "snapfile.h"
 
 #define MODE_INSUPD_DB  0

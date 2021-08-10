@@ -26,6 +26,8 @@
 
 EXEC SQL INCLUDE SQLCA;
 
+int  gnSeqSwno = 0;
+int  gnSeqCid = 0;
 int  gnDefRad = 30;
 int  gnCommitRec = 1000;
 char *pbuf_cell[SIZE_BUFF];
@@ -83,6 +85,70 @@ void disconnErm()
 
 }
 
+int getCurrId(int id_type)
+{
+    int id = 0;
+    if ( id_type == _CELL_ID_ ) {
+        gnSeqCid = 0;
+        EXEC SQL AT ERM_DB SELECT SEQ_CID.NEXTVAL INTO :gnSeqCid FROM DUAL;
+        if ( sqlca.sqlcode != SUCCESS ) {
+            trimStr(sqlca.sqlerrm.sqlerrmc);
+            writeLog(LOG_ERR, "getCurrId(CELL): unable to get current sequence value Ora(%d) - %s", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        }
+        else {
+            id = gnSeqCid;
+        }
+        writeLog(LOG_INF, "cell_id start from %d", id);
+    }
+    else {  // _CELL_SET_
+        gnSeqSwno = 0;
+        EXEC SQL AT ERM_DB SELECT SEQ_SWID.NEXTVAL INTO :gnSeqSwno FROM DUAL;
+        if ( sqlca.sqlcode != SUCCESS ) {
+            trimStr(sqlca.sqlerrm.sqlerrmc);
+            writeLog(LOG_ERR, "getCurrId(CELL_SET): unable to get current sequence value Ora(%d) - %s", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        }
+        else {
+            id = gnSeqSwno;
+        }
+        writeLog(LOG_INF, "cell_set id start from %d", id);
+    }
+
+    return id;
+}
+
+void setCurrId(int id_type,  int currval)
+{
+    VARCHAR szCrtSql[SIZE_ITEM_L];
+    char szSeqId[30];
+    char szNxtSeq[50];
+    int db_currval = 0;
+
+    memset(szSeqId, 0x00, sizeof(szSeqId));
+    memset(szNxtSeq, 0x00, sizeof(szNxtSeq));
+    if ( id_type == _CELL_ID_ ) {
+        strcpy(szSeqId, "\"CFMS\".\"SEQ_CID\"");
+    }
+    else {
+        strcpy(szSeqId, "\"CFMS\".\"SEQ_SWID\"");
+    }
+    sprintf(szNxtSeq, "%s.NEXTVAL", szSeqId);
+
+    int nextval = ( currval <= 1 ? 1 : currval + 1 );
+    EXEC SQL AT ERM_DB SELECT :szNxtSeq INTO :db_currval FROM DUAL;
+    if ( db_currval > nextval ) {
+        nextval = db_currval;
+    }
+
+    sprintf((char*)szCrtSql.arr, "DROP SEQUENCE %s", szSeqId);
+    szCrtSql.len = strlen((char *)szCrtSql.arr);
+    EXEC SQL AT ERM_DB EXECUTE IMMEDIATE :szCrtSql;
+
+    sprintf((char*)szCrtSql.arr, "CREATE SEQUENCE %s START WITH %d", szSeqId, nextval);
+    szCrtSql.len = strlen((char *)szCrtSql.arr);
+    writeLog(LOG_INF, "%s", szCrtSql.arr);
+    EXEC SQL AT ERM_DB EXECUTE IMMEDIATE :szCrtSql;
+}
+
 int updateProcRecord(const char *tab_name, const char *row_id, char feed_flg)
 {
     VARCHAR szUSql[SIZE_BUFF];
@@ -112,6 +178,8 @@ void procInsUpd(char inp_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
     insUpdCellAreaTH();
     insUpdCellAreaEN();
     insUpdCellSetAndCell(inp_ini, comm_ini);
+    setCurrId(_CELL_ID_,  gnSeqCid);
+    setCurrId(_CELL_SET_, gnSeqSwno);
 }
 
 #if 0
@@ -373,20 +441,25 @@ void insUpdCellSetAndCell(char inp_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM
                         continue;
                     }
 
-                    insUpdCellSet(errstr);
-                    if ( insUpdCell(cell_type, errstr) == SUCCESS ) {
-                        if ( ++success_cnt % gnCommitRec == 0 ) {
-                            writeLog(LOG_INF, "insUpdCellSetAndCell: success/commit %d", success_cnt);
-                            EXEC SQL AT ERM_DB COMMIT;
+                    if ( insUpdCellSet(errstr) == SUCCESS ) {
+                        if ( insUpdCell(cell_type, errstr) == SUCCESS ) {
+                            if ( ++success_cnt % gnCommitRec == 0 ) {
+                                writeLog(LOG_INF, "insUpdCellSetAndCell: success/commit %d", success_cnt);
+                                EXEC SQL AT ERM_DB COMMIT;
+                            }
+                        }
+                        else {
+                            writeLog(LOG_DB1, "error in insUpdCell - %s", errstr);
+                            if ( ++error_cnt > NUM_ERR_ALLOW ) {
+                                EXEC SQL AT ERM_DB COMMIT;
+                                writeLog(LOG_ERR, "insUpdCellSetAndCell: last error before stop: %s", errstr);
+                                writeLog(LOG_ERR, "insUpdCellSetAndCell: error %d exceeded %d, stop loading", error_cnt, NUM_ERR_ALLOW);
+                                break;
+                            }
                         }
                     }
                     else {
-                        if ( ++error_cnt > NUM_ERR_ALLOW ) {
-                            EXEC SQL AT ERM_DB COMMIT;
-                            writeLog(LOG_ERR, "insUpdCellSetAndCell: last error before stop: %s", errstr);
-                            writeLog(LOG_ERR, "insUpdCellSetAndCell: error %d exceeded %d, stop loading", error_cnt, NUM_ERR_ALLOW);
-                            break;
-                        }
+                        writeLog(LOG_ERR, "insUpdCellSetAndCell(CellSet): error %s", errstr);
                     }
                 }
 
@@ -426,106 +499,226 @@ void insUpdCellSetAndCell(char inp_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM
 
 int insUpdCellSet(char *errstr)
 {
-    VARCHAR szSql[SIZE_BUFF_2X];
-    static int init_cs = 0;
+    char szLat[USR_LATLNG], szLong[USR_LATLNG];
+    char szSwNo[USR_SWID], szDesc[ERM_DESC];
+    char szSid[USR_SID], szFrmSwid[ERM_SWID];
+    char szProvTh[ERM_DESC];
+    int nRadius, result = SUCCESS;
 
-    if ( init_cs == 0 ) {
-        sprintf((char*)szSql.arr, "MERGE INTO CELL_SET tgt USING " \
-            "(SELECT SID, LATITUDE, LONGITUDE, NVL(RADIUS, :v1) RADIUS, :v2 || '-' || :v3 DESCR, :v4 || '-' || :v5 SWITCH_NO FROM CELL_AREA WHERE DESC_TH = :v6) src " \
-                "ON (tgt.SID = src.SID AND tgt.SWITCH_NO = src.DESCR) " \
-             "WHEN MATCHED " \
-                "THEN UPDATE SET " \
-                    "tgt.DESCRIPTION = src.DESCR, " \
-                    "tgt.LATITUDE = src.LATITUDE, " \
-                    "tgt.LONGITUDE = src.LONGITUDE, " \
-                    "tgt.RADIUS = src.RADIUS, " \
-                    "tgt.IS_UPDATED = 'Y', " \
-                    "tgt.LAST_UPDATE = SYSDATE " \
-                "WHERE " \
-                    "(tgt.DESCRIPTION <> src.DESCR) " \
-                    "OR (tgt.LATITUDE <> src.LATITUDE) " \
-                    "OR (tgt.LONGITUDE <> src.LONGITUDE) " \
-                    "OR (tgt.RADIUS <> src.RADIUS) " \
-             "WHEN NOT MATCHED " \
-                "THEN INSERT (tgt.FRM_SWID, tgt.SID, tgt.SWITCH_NO, tgt.DESCRIPTION, tgt.LATITUDE, tgt.LONGITUDE, tgt.RADIUS, tgt.IS_UPDATED, tgt.LAST_UPDATE) " \
-                    "VALUES (TRIM(TO_CHAR(SEQ_SWID.NEXTVAL,'0000000')), src.SID, src.SWITCH_NO, src.DESCR, src.LATITUDE, src.LONGITUDE, src.RADIUS, 'Y', SYSDATE) ");
-                //, gnDefRad, pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL], pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL], pbuf_cell[E_PROVINCE]);
-                //, gnDefRad, pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL], pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL]);
-        szSql.len = strlen((char*)szSql.arr);
-        writeLog(LOG_DB1, (char*)szSql.arr);
+    VARCHAR szQSql[SIZE_BUFF];
+    VARCHAR szUSql[SIZE_BUFF];
+    VARCHAR szISql[SIZE_BUFF];
 
-        //EXEC SQL AT ERM_DB EXECUTE IMMEDIATE :szSql;
-        EXEC SQL AT ERM_DB PREPARE UCS FROM :szSql;
-        init_cs = 1;
-    }
-    //EXEC SQL AT ERM_DB EXECUTE CS USING :pbuf_cell[E_PROVINCE];
-    EXEC SQL AT ERM_DB EXECUTE UCS USING :gnDefRad, :pbuf_cell[E_AMPHUR], :pbuf_cell[E_TUMBOL], :pbuf_cell[E_AMPHUR], :pbuf_cell[E_TUMBOL], :pbuf_cell[E_PROVINCE];
-    if ( sqlca.sqlcode == SUCCESS ) {
-        return SUCCESS;
-    }
-    else {
-        sprintf(errstr, "%d (%s)", sqlca.sqlcode, trimStr(sqlca.sqlerrm.sqlerrmc));
+    static int isInitUdp = 1;
+    static int isInitSeq = 1;
+
+    memset(szLat, 0x00, sizeof(szLat));
+    memset(szLong, 0x00, sizeof(szLong));
+    memset(szFrmSwid, 0x00, sizeof(szFrmSwid));
+    memset(szSwNo, 0x00, sizeof(szSwNo));
+    memset(szDesc, 0x00, sizeof(szDesc));
+    memset(szSid, 0x00, sizeof(szSid));
+
+    sprintf(szSwNo, "%s-%s", pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL]);
+    strcpy(szDesc, szSwNo);
+    strcpy(szProvTh, pbuf_cell[E_PROVINCE]);
+
+    sprintf((char*)szQSql.arr, "SELECT A.SID, A.LATITUDE, A.LONGITUDE, NVL(A.RADIUS, %d) FROM CELL_AREA A, CELL_SET S " \
+        "WHERE A.DESC_TH = '%s' AND A.SID = S.SID AND S.SWITCH_NO = '%s' ", gnDefRad, szProvTh, szSwNo);
+    szQSql.len = strlen((char*)szQSql.arr);
+
+    EXEC SQL AT ERM_DB PREPARE orcSetStmt FROM :szQSql;
+    EXEC SQL AT ERM_DB DECLARE orcSetCur CURSOR FOR orcSetStmt;
+    EXEC SQL AT ERM_DB OPEN orcSetCur;
+
+    if ( sqlca.sqlcode != SUCCESS ) {
+        trimStr(sqlca.sqlerrm.sqlerrmc);
+        writeLog(LOG_ERR, "insUpdCellSet: unable to open orcSetCur on CELL_SET table, Ora(%d) - %s", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        EXEC SQL AT ERM_DB CLOSE orcSetCur;
         return FAILED;
     }
+
+    EXEC SQL AT ERM_DB FETCH orcSetCur INTO :szSid, :szLat, :szLong, :nRadius;
+    if ( sqlca.sqlcode == SUCCESS ) {
+        if ( isInitUdp ) {
+            strcpy((char*)szUSql.arr, "UPDATE CELL_SET SET DESCRIPTION = :U1 " \
+                ", LATITUDE = :U2 " \
+                ", LONGITUDE = :U3 " \
+                ", RADIUS = :U4 " \
+                ", IS_UPDATED = 'Y' " \
+                ", LAST_UPDATE = SYSDATE WHERE SID = :U5 AND SWITCH_NO = :U6 ");
+            szUSql.len = strlen((char*)szUSql.arr);
+            EXEC SQL AT ERM_DB PREPARE UPD_CELLSET FROM :szUSql;
+            isInitUdp = 0;
+        }
+        strcpy(szSid, trimStr(szSid));
+        strcpy(szLat, trimStr(szLat));
+        strcpy(szLong, trimStr(szLong));
+        EXEC SQL AT ERM_DB EXECUTE UPD_CELLSET USING :szSwNo, :szLat, :szLong, :nRadius, :szSid, :szSwNo;
+
+        if ( sqlca.sqlcode != SUCCESS ) {
+            sprintf(errstr, "insUpdCellSet(update) %d (%s) ['%s', '%s', '%s', '%d', '%s']", sqlca.sqlcode, trimStr(sqlca.sqlerrm.sqlerrmc), szSwNo, szLat, szLong, nRadius, szSid);
+            result = FAILED;
+        }
+    }
+    else if ( sqlca.sqlcode == NOT_FOUND ) {
+
+        EXEC SQL AT ERM_DB SELECT SID, LATITUDE, LONGITUDE, NVL(RADIUS, :gnDefRad) INTO :szSid, :szLat, :szLong, :nRadius FROM CELL_AREA WHERE DESC_TH = :szProvTh;
+
+        if ( isInitSeq ) {
+            gnSeqSwno = getCurrId(_CELL_SET_);
+            strcpy((char*)szISql.arr, "INSERT INTO CELL_SET VALUES(TRIM(TO_CHAR(:I1,'0000000')), :I2, :I3, :I4, :I5, :I6, :I7, 'Y', SYSDATE) ");
+            szISql.len = strlen((char*)szISql.arr);
+            EXEC SQL AT ERM_DB PREPARE INS_CELLSET FROM :szISql;
+            isInitSeq = 0;
+        }
+        strcpy(szSid, trimStr(szSid));
+        strcpy(szLat, trimStr(szLat));
+        strcpy(szLong, trimStr(szLong));
+
+        while ( TRUE ) {
+            EXEC SQL AT ERM_DB EXECUTE INS_CELLSET USING :gnSeqSwno, :szSid, :szSwNo, :szDesc, :szLat, :szLong, :gnDefRad;
+            if ( sqlca.sqlcode != SUCCESS ) {
+                if ( sqlca.sqlcode == KEY_DUP ) {
+                    ++gnSeqSwno;
+                    continue;
+                }
+                else {
+                    sprintf(errstr, "insUpdCellSet(insert) %d (%s) ['%d', '%s', '%s', '%s', '%s', '%d'] (%s)", sqlca.sqlcode, trimStr(sqlca.sqlerrm.sqlerrmc), gnSeqSwno, szSid, szSwNo, szLat, szLong, gnDefRad, szProvTh);
+                    result = FAILED;
+                    break;
+                }
+            }
+            else {
+                ++gnSeqSwno;
+                break;
+            }
+        }
+    }
+    else {
+        trimStr(sqlca.sqlerrm.sqlerrmc);
+        writeLog(LOG_ERR, "insUpdCellSet: unable to open orcSetCur on CELL_SET table, Ora(%d) - %s", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        result = FAILED;
+    }
+    EXEC SQL AT ERM_DB CLOSE orcSetCur;
+    return result;
+
 }
 
 int insUpdCell(const char *cell_type, char *errstr)
 {
-    char szLat[10], szLong[10];
-    char szCgi[31], szCellId[26];
-    VARCHAR szSql[SIZE_BUFF_2X];
-    static int init = 0;
+    char szLat[USR_LATLNG], szLong[USR_LATLNG];
+    char szCgi[USR_CELL], szCellId[USR_CELL];
+    char szSwNo[USR_SWID], szDesc[ERM_DESC];
+
+    char szSid[USR_SID], szFrmCellId[ERM_CELL];
+    int nRadius, result = SUCCESS;
+
+    VARCHAR szQSql[SIZE_BUFF];
+    VARCHAR szUSql[SIZE_BUFF];
+    VARCHAR szISql[SIZE_BUFF];
+
+    static int isInitUdp = 1;
+    static int isInitSeq = 1;
 
     memset(szLat, 0x00, sizeof(szLat));
     memset(szLong, 0x00, sizeof(szLong));
     memset(szCgi, 0x00, sizeof(szCgi));
     memset(szCellId, 0x00, sizeof(szCellId));
+    memset(szSwNo, 0x00, sizeof(szSwNo));
+    memset(szDesc, 0x00, sizeof(szDesc));
+    memset(szSid, 0x00, sizeof(szSid));
 
     sprintf(szLat, "%02d-%02d-%02d%s", atoi(pbuf_cell[E_LAT2]), atoi(pbuf_cell[E_LAT3]), atoi(pbuf_cell[E_LAT4]), pbuf_cell[E_LAT1]);
     sprintf(szLong, "%02d-%02d-%02d%s", atoi(pbuf_cell[E_LONG2]), atoi(pbuf_cell[E_LONG3]), atoi(pbuf_cell[E_LONG4]), pbuf_cell[E_LONG1]);
     strcpy(szCellId, pbuf_cell[E_CELL_CODE]);
     strcpy(szCgi, strReplaceAll(pbuf_cell[E_CGI], "-", ""));
-//printf("%s\t%s\n", szLat, szLong);
-    //gnDefRad
+    sprintf(szSwNo, "%s-%s", pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL]);
+    sprintf(szDesc, "%s-%.95s", cell_type, pbuf_cell[E_SITE_NAME]);
 
-    if ( init == 0 ) {
-    sprintf((char*)szSql.arr, "MERGE INTO CELL tgt USING " \
-"(SELECT SID, SWITCH_NO, RADIUS, :c1 CELL_ID, :c2 || '-' || :c3  DESCRIPTION, :c4 LATITUDE, :c5 LONGITUDE, :c6 CGI FROM CELL_SET WHERE SWITCH_NO = :c7 || '-' || :c8 ) src " \
-            "ON (tgt.SID = src.SID AND tgt.SWITCH_NO = src.SWITCH_NO AND tgt.CELL_ID = src.CELL_ID) " \
-        "WHEN MATCHED " \
-        "THEN UPDATE SET " \
-                "tgt.DESCRIPTION = src.DESCRIPTION, " \
-                "tgt.LATITUDE = src.LATITUDE, " \
-                "tgt.LONGITUDE = src.LONGITUDE, " \
-                "tgt.RADIUS = src.RADIUS, " \
-                "tgt.CGI = src.CGI, " \
-                "tgt.IS_UPDATED = 'Y', " \
-                "tgt.LAST_UPDATE = SYSDATE " \
-            "WHERE " \
-                "tgt.DESCRIPTION <> src.DESCRIPTION " \
-                "OR tgt.LATITUDE <> src.LATITUDE " \
-                "OR tgt.LONGITUDE <> src.LONGITUDE " \
-                "OR tgt.RADIUS <> src.RADIUS " \
-                "OR tgt.CGI <> src.CGI " \
-        "WHEN NOT MATCHED " \
-            "THEN INSERT (tgt.FRM_CELL_ID, tgt.SID, tgt.SWITCH_NO, tgt.CELL_ID, tgt.DESCRIPTION, tgt.LATITUDE, tgt.LONGITUDE, tgt.CGI, tgt.RADIUS, tgt.IS_UPDATED, tgt.LAST_UPDATE) " \
-            "VALUES (TRIM(TO_CHAR(SEQ_CID.NEXTVAL,'0XXXX')), src.SID, src.SWITCH_NO, src.CELL_ID, src.DESCRIPTION, src.LATITUDE, src.LONGITUDE, src.CGI, src.RADIUS, 'Y', SYSDATE) ");
-        //, szCellId, cell_type, pbuf_cell[E_SITE_NAME], szLat, szLong, szCgi, pbuf_cell[E_AMPHUR], pbuf_cell[E_TUMBOL]);
-    szSql.len = strlen((char*)szSql.arr);
-    writeLog(LOG_DB1, (char*)szSql.arr);
+    sprintf((char*)szQSql.arr, "SELECT S.SID, S.RADIUS " \
+        "FROM CELL_SET S, CELL C " \
+        "WHERE " \
+        "S.SWITCH_NO = '%s' " \
+        "AND S.SID = C.SID " \
+        "AND S.SWITCH_NO = C.SWITCH_NO " \
+        "AND C.CELL_ID = '%s'", szSwNo, szCellId);
+    szQSql.len = strlen((char*)szQSql.arr);
 
-    //EXEC SQL AT ERM_DB EXECUTE IMMEDIATE :szSql;
-    EXEC SQL AT ERM_DB PREPARE CELL FROM :szSql;
-    init = 1;
-    }
-    EXEC SQL AT ERM_DB EXECUTE CELL USING :szCellId, :cell_type, :pbuf_cell[E_SITE_NAME], :szLat, :szLong, :szCgi, :pbuf_cell[E_AMPHUR], :pbuf_cell[E_TUMBOL];
-    if ( sqlca.sqlcode == SUCCESS ) {
-        return SUCCESS;
-    }
-    else {
-        sprintf(errstr, "%d (%s)", sqlca.sqlcode, trimStr(sqlca.sqlerrm.sqlerrmc));
+    EXEC SQL AT ERM_DB PREPARE orcCidStmt FROM :szQSql;
+    EXEC SQL AT ERM_DB DECLARE orcCidCur CURSOR FOR orcCidStmt;
+    EXEC SQL AT ERM_DB OPEN orcCidCur;
+
+    if ( sqlca.sqlcode != SUCCESS ) {
+        trimStr(sqlca.sqlerrm.sqlerrmc);
+        writeLog(LOG_ERR, "insUpdCell: unable to open orcCidCur on CELL_SET table, Ora(%d) - %s", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        EXEC SQL AT ERM_DB CLOSE orcCidCur;
         return FAILED;
     }
+
+    EXEC SQL AT ERM_DB FETCH orcCidCur INTO :szSid, :nRadius;
+    if ( sqlca.sqlcode == SUCCESS ) {
+        if ( isInitUdp ) {
+            strcpy((char*)szUSql.arr, "UPDATE CELL SET " \
+                "DESCRIPTION = :u1, LATITUDE = :u2, LONGITUDE = :u3, RADIUS = :u4, CGI = :u5, IS_UPDATED = 'Y', LAST_UPDATE = SYSDATE " \
+                "WHERE SID = :u6 AND SWITCH_NO = :u7 AND CELL_ID = :u8");
+            szUSql.len = strlen((char*)szUSql.arr);
+            EXEC SQL AT ERM_DB PREPARE UPD_CELL FROM :szUSql;
+            isInitUdp = 0;
+        }
+        strcpy(szSid, trimStr(szSid));
+        EXEC SQL AT ERM_DB EXECUTE UPD_CELL USING :szDesc, :szLat, :szLong, :nRadius, :szCgi, :szSid, :szSwNo, :szCellId;
+
+        if ( sqlca.sqlcode != SUCCESS ) {
+            sprintf(errstr, "insUpdCell(update) %d (%s) ['%s', '%s', '%s', '%d', '%s', '%s', '%s', '%s']", sqlca.sqlcode, trimStr(sqlca.sqlerrm.sqlerrmc), szDesc, szLat, szLong, nRadius, szCgi, szSid, szSwNo, szCellId);
+            result = FAILED;
+        }
+    }
+    else if ( sqlca.sqlcode == NOT_FOUND ) {
+
+        EXEC SQL AT ERM_DB SELECT SID, RADIUS INTO :szSid, :nRadius FROM CELL_SET WHERE SWITCH_NO = :szSwNo;
+
+        if ( isInitSeq ) {
+            gnSeqCid = getCurrId(_CELL_ID_);
+
+            strcpy((char*)szISql.arr, "INSERT INTO CELL(FRM_CELL_ID, SID, SWITCH_NO, CELL_ID, DESCRIPTION, LATITUDE, LONGITUDE, CGI, RADIUS, IS_UPDATED, LAST_UPDATE) " \
+            "VALUES (:i1, :i2, :i3, :i4, :i5, :i6, :i7, :i8, :i9, 'Y', SYSDATE)");
+            szISql.len = strlen((char*)szISql.arr);
+            EXEC SQL AT ERM_DB PREPARE INS_CELL FROM :szISql;
+            isInitSeq = 0;
+        }
+        strcpy(szSid, trimStr(szSid));
+        memset(szFrmCellId, 0x00, sizeof(szFrmCellId));
+        strcpy(szSid, trimStr(szSid));
+
+        while ( TRUE ) {
+            sprintf(szFrmCellId, "%s", decTo64(gnSeqCid));
+            EXEC SQL AT ERM_DB EXECUTE INS_CELL USING :szFrmCellId, :szSid, :szSwNo, :szCellId, :szDesc, :szLat, :szLong, :szCgi, :nRadius;
+            if ( sqlca.sqlcode != SUCCESS ) {
+                if ( sqlca.sqlcode == KEY_DUP ) {
+                    ++gnSeqCid;
+                    continue;
+                }
+                else {
+                    sprintf(errstr, "insUpdCell(insert) %d (%s) ['%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d'] ", sqlca.sqlcode, trimStr(sqlca.sqlerrm.sqlerrmc), szFrmCellId, szSid, szSwNo, szCellId, szDesc, szLat, szLong, szCgi, nRadius);
+                    result = FAILED;
+                    break;
+                }
+            }
+            else {
+                ++gnSeqCid;
+                break;
+            }
+        }
+    }
+    else {
+        trimStr(sqlca.sqlerrm.sqlerrmc);
+        writeLog(LOG_ERR, "insUpdCell: unable to open orcCidCur on CELL_SET table, Ora(%d) - %s", sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+        result = FAILED;
+    }
+    EXEC SQL AT ERM_DB CLOSE orcCidCur;
+    return result;
+
 }
 
 int validateGeoField(int err_or_ign, char *info)
@@ -638,7 +831,7 @@ void wrtCellArea(char out_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
     FILE *ofile = NULL, *mfile = NULL;
     char tabname[30], file_name[SIZE_ITEM_L], full_name[SIZE_ITEM_L], cmd[SIZE_ITEM_L];
     int rdRec = 0;
-    char szSid[6+1], szDesc[250+1], szLat[10+1], szLong[10+1], szRowId[SIZE_ITEM_T];
+    char szSid[ERM_SID], szDesc[ERM_DESC], szLat[USR_LATLNG], szLong[USR_LATLNG], szRowId[SIZE_ITEM_T];
     char map_fname[SIZE_ITEM_L], szGeoCdrMap[] = "CELLAREA_GEO.DAT";
     int nRad;
 
@@ -746,7 +939,7 @@ void wrtCellSet(char out_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
     FILE *ofile = NULL;
     char tabname[30], fname[SIZE_ITEM_L], file_name[SIZE_ITEM_L], cmd[SIZE_ITEM_L];
     int rdRec = 0;
-    char szSid[6+1], szSwid[7+1], szDesc[250+1], szLat[10+1], szLong[10+1], szRowId[SIZE_ITEM_T];
+    char szSid[ERM_SID], szSwid[ERM_SWID], szDesc[ERM_DESC], szLat[USR_LATLNG], szLong[USR_LATLNG], szRowId[SIZE_ITEM_T];
     int nRad;
 
     memset(tabname, 0x00, sizeof(tabname));
@@ -839,7 +1032,8 @@ void wrtCell(char out_ini[][SIZE_ITEM_L], char comm_ini[][SIZE_ITEM_L])
     FILE *ofile = NULL, *mfile = NULL;
     char tabname[30], fname[SIZE_ITEM_L], file_name[SIZE_ITEM_L], cmd[SIZE_ITEM_L];
     int oRec = 0, mRec = 0;
-    char szSid[6+1], szSwid[7+1], szId[5+1], szDesc[250+1], szLat[10+1], szLong[10+1], szRowId[SIZE_ITEM_T], szCgi[30+1], szFlag[2];
+    char szSid[ERM_SID], szSwid[ERM_SWID], szId[ERM_CELL], szDesc[ERM_DESC], szLat[USR_LATLNG], szLong[USR_LATLNG];
+    char szRowId[SIZE_ITEM_T], szCgi[USR_CELL], szFlag[2];
     char map_fname[SIZE_ITEM_L], szGeoCdrMap[] = "CELL_GEO.DAT";
     int nRad, nSeq;
 

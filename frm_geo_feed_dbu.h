@@ -35,7 +35,7 @@
 // #include <sqlda.h>
 // #include <sqlcpr.h>
 
-#include "geo_feed.h"
+#include "frm_geo_feed.h"
 #include "strlogutl.h"
 #include "glb_str_def.h"
 
@@ -64,6 +64,20 @@
 
 #define IS_IGN                  1
 #define IS_ERR                  2
+
+#define ERM_SID                 6+1
+#define ERM_SWID                7+1
+#define ERM_CELL                5+1
+#define ERM_DESC                100+1
+
+#define USR_SID                 ERM_SID
+#define USR_SWID                100+1
+#define USR_CELL                30+1
+
+#define USR_LATLNG              15
+
+#define _CELL_ID_               0
+#define _CELL_SET_              1
 
 #ifdef	__cplusplus
 extern "C" {
@@ -111,6 +125,9 @@ void    setCommitRec(int commit_cnt);
 void    setDefRadius(int def_radius);
 int     connectDbErm(char *szDbUsr, char *szDbPwd, char *szDbSvr);
 void    disconnErm();
+
+int     getCurrId(int id_type);
+void    setCurrId(int id_type, int currval);
 
 int     updateProcRecord(const char *tab_name, const char *row_id, char feed_flg);
 
